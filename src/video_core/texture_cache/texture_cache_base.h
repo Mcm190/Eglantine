@@ -243,6 +243,9 @@ public:
     /// Return a reference to the given image view id
     [[nodiscard]] ImageView& GetImageView(ImageViewId id) noexcept;
 
+    /// Returns true if the current clear's render area and scissor cover a width x height image
+    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
+
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 
