@@ -255,7 +255,7 @@ private:
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
-    bool ClearVolumeSlice(const Framebuffer* framebuffer, u32 slice);
+    bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
