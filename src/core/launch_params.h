@@ -23,6 +23,9 @@ struct LaunchParams {
     std::optional<int> selected_user{};
     std::optional<u16> override_gdb_port{};
     std::optional<std::string> log_filter{};
+    bool mcp_enable = false;
+    std::optional<u16> mcp_port{};
+    bool mcp_allow_writes = false;
     // --pack-nup <dump> [<out.nup>]: packs a loose dump instead of booting a game (eden-cli).
     std::optional<std::string> pack_nup_source{};
     // --unpack-nup <file.nup> [<out_dir>]: extracts a NUP back into a loose dump.

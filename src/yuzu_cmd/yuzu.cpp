@@ -63,6 +63,10 @@
 #endif
 #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
+#ifdef YUZU_ENABLE_MCP
+#include "mcp/server.h"
+#include "yuzu_cmd/mcp_host_cli.h"
+#endif
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -254,6 +258,10 @@ struct SdlState {
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
+#ifdef YUZU_ENABLE_MCP
+    std::unique_ptr<CliMcpHost> mcp_host;
+    std::unique_ptr<Mcp::Server> mcp_server;
+#endif
 };
 
 constexpr int kRestartExitCode = 75;
@@ -723,6 +731,24 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     void(state->system.Run());
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
+
+#ifdef YUZU_ENABLE_MCP
+    // eden-cli starts the MCP server only when asked (--mcp), so unattended runs never collide
+    // with a desktop emulator holding the port.
+    if (lp.mcp_enable) {
+        Mcp::ServerConfig mcp_config;
+        mcp_config.port = lp.mcp_port.value_or(Settings::values.mcp_port.GetValue());
+        mcp_config.allow_writes = lp.mcp_allow_writes || Settings::values.mcp_allow_writes.GetValue();
+        mcp_config.bearer_token = Settings::values.mcp_token.GetValue();
+        state->mcp_host = std::make_unique<CliMcpHost>(state->system, state->input_subsystem);
+        state->mcp_server =
+            std::make_unique<Mcp::Server>(state->system, *state->mcp_host, std::move(mcp_config));
+        if (const std::string error = state->mcp_server->Start(); !error.empty()) {
+            LOG_ERROR(Frontend, "MCP server: {}", error);
+            state->mcp_server.reset();
+        }
+    }
+#endif
     return SDL_APP_CONTINUE;
 }
 // EDEN_NX2_KEY_SCRIPT="seconds:code,seconds:-code,..." (or "@<file>"): press (code) or release (-code) keyboard
@@ -846,6 +872,14 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::Sys
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+#ifdef YUZU_ENABLE_MCP
+    if (state->mcp_host) {
+        state->mcp_host->DrainMainThread();
+        if (state->mcp_host->QuitRequested()) {
+            return SDL_APP_SUCCESS;
+        }
+    }
+#endif
     RunKeyScript(state->input_subsystem, state->system);
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
@@ -866,6 +900,10 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (!state) {
         return;
     }
+#ifdef YUZU_ENABLE_MCP
+    state->mcp_server.reset(); // stops serving before the system goes away
+    state->mcp_host.reset();
+#endif
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would

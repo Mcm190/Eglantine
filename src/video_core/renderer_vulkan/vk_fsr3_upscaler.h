@@ -31,6 +31,9 @@ public:
         VkImageView depth;          ///< Device depth (reversed) at the render size.
         VkImageView motion_vectors; ///< Motion to the previous frame at the render size.
         VkExtent2D render_size;
+        /// The largest render size to expect (a game with dynamic resolution renders a region of
+        /// its targets); zero when it does not change.
+        VkExtent2D max_render_size{};
         VkExtent2D upscale_size;
         /// This frame's sample offset in render pixels: input texel k sampled k + 0.5 - jitter.
         std::array<f32, 2> jitter;
@@ -106,6 +109,7 @@ private:
     Texture output;
 
     VkExtent2D render_extent{};
+    VkExtent2D allocated_extent{}; ///< The render-size images' extent, at least render_extent.
     VkExtent2D upscale_extent{};
     std::array<s32, 2> previous_render_size{};
     std::array<s32, 2> previous_upscale_size{};

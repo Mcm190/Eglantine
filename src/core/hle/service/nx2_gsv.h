@@ -1801,10 +1801,12 @@ private:
         // the frame rendered with the next one's (one-frame white or overexposed flashes).
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        constexpr u64 DuskbloodsProgramId = 0x0400D1D02399A000ULL;
         int frames_ahead = frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
         if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
-                                   app_program_id == OcarinaOfTimeProgramId)) {
+                                   app_program_id == OcarinaOfTimeProgramId ||
+                                   app_program_id == DuskbloodsProgramId)) {
             frames_ahead = 0;
         }
         const auto entered = std::chrono::steady_clock::now();

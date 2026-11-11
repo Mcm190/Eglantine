@@ -12,6 +12,7 @@
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
+#include "core/debugger/trace_hooks.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/k_readable_event.h"
@@ -2505,6 +2506,11 @@ void Call(Core::System& system, u32 imm) {
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
+    const auto svc_hook = Core::Trace::g_svc_hook.load(std::memory_order_relaxed);
+    std::array<u64, 4> svc_in{};
+    if (svc_hook != nullptr) {
+        svc_in = {GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2), GetArg64(args, 3)};
+    }
     GetCurrentThread(kernel).SetEnteredKernel();
     //kernel.EnterSVCProfile();
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
@@ -2578,6 +2584,14 @@ void Call(Core::System& system, u32 imm) {
         LOG_INFO(Kernel_SVC, "svc {:#04x} out t{} [0]={:#x} [1]={:#x} [2]={:#x}", imm,
                  GetCurrentThread(kernel).GetThreadId(), GetArg64(args, 0), GetArg64(args, 1),
                  GetArg64(args, 2));
+    }
+    if (svc_hook != nullptr) {
+        svc_hook(Core::Trace::SvcCall{
+            .imm = imm,
+            .thread_id = GetCurrentThread(kernel).GetThreadId(),
+            .in = svc_in,
+            .out = {GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2)},
+        });
     }
     //kernel.ExitSVCProfile();
     kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);

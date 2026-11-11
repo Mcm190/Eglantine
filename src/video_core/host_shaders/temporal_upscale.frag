@@ -22,6 +22,7 @@ layout(push_constant) uniform PushConstants {
     float clip_width;                 // neighbourhood clip of still pixels, in deviations
     float clip_motion;                // clip of pixels moving a pixel or more per frame
     float kernel_motion;              // kernel distance scale of moving pixels
+    layout(offset = 56) vec2 render_size;
 };
 
 layout(location = 0) in vec2 texcoord;  // 0 to 1 across the output
@@ -81,8 +82,9 @@ vec3 SampleHistory(vec2 position) {
 }
 
 void main() {
-    const ivec2 input_size = textureSize(input_color, 0);
-    const ivec2 motion_size = textureSize(motion_vectors, 0);
+    const ivec2 input_size = ivec2(render_size);
+    const bool has_region = input_size != textureSize(input_color, 0);
+    const ivec2 motion_size = has_region ? input_size : textureSize(motion_vectors, 0);
     // The output pixel's centre in input pixels. Input texel k sampled the scene at k + 0.5 - jitter
     // (the sign measured against consecutive frames).
     const vec2 target = texcoord * vec2(input_size);

@@ -88,7 +88,6 @@ void Fermi2D::Blit() {
     UNIMPLEMENTED_IF_MSG(regs.operation != Operation::SrcCopy, "Operation is not copy");
     UNIMPLEMENTED_IF_MSG(regs.src.layer != 0, "Source layer is not zero");
     UNIMPLEMENTED_IF_MSG(regs.dst.layer != 0, "Destination layer is not zero");
-    UNIMPLEMENTED_IF_MSG(regs.src.depth != 1, "Source depth is not one");
     UNIMPLEMENTED_IF_MSG(regs.clip_enable != 0, "Clipped blit enabled");
 
     const auto& args = regs.pixels_from_memory;
@@ -155,7 +154,12 @@ void Fermi2D::Blit() {
     }
 
     memory_manager.FlushCaching();
-    if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
+    // A game copies a volume one slice per blit and passes each slice's address as a surface of
+    // the volume's depth. The texture cache has no image for such a surface: The Duskbloods'
+    // 16x16x16 colour grading table came out dark and green while it blended between areas.
+    // Guest memory has the slice where the address says.
+    const bool volume_slice = src.depth > 1 || regs.dst.depth > 1;
+    if (volume_slice || !rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
         sw_blitter->Blit(src, regs.dst, config);
     }
 }

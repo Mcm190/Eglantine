@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_turbo_mode.h"
+#include "video_core/renderer_vulkan/turbo_mode_pacer.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -151,6 +152,7 @@ void TurboMode::Run(std::stop_token stop_token) {
     // Create a single command buffer.
     auto cmdbufs = command_pool.Allocate(1, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
     auto cmdbuf = vk::CommandBuffer{cmdbufs[0], m_device.GetDispatchLoader()};
+    TurboModePacer pacer;
 #endif
 
     while (!stop_token.stop_requested()) {
@@ -159,6 +161,17 @@ void TurboMode::Run(std::stop_token stop_token) {
         adrenotools_set_turbo(true);
 #endif
 #else
+        {
+            std::unique_lock lk{m_submission_lock};
+            m_submission_cv.wait_for(lk, stop_token, TurboModePacer::PollInterval,
+                                     [] { return false; });
+            if (stop_token.stop_requested()) {
+                break;
+            }
+            if (!pacer.ShouldBoost(TurboModePacer::Clock::now(), m_submission_time)) {
+                continue;
+            }
+        }
         // Reset the fence.
         fence.Reset();
 
@@ -194,6 +207,14 @@ void TurboMode::Run(std::stop_token stop_token) {
 
         // Clear the buffer.
         cmdbuf.FillBuffer(*buffer, 0, VK_WHOLE_SIZE, 0);
+        const VkMemoryBarrier cleared{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, cleared);
 
         // Bind descriptor set.
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
@@ -223,14 +244,18 @@ void TurboMode::Run(std::stop_token stop_token) {
         m_device.GetGraphicsQueue().Submit(std::array{submit_info}, *fence);
 
         // Wait for completion.
-        fence.Wait();
+        if (fence.Wait() != VK_SUCCESS) {
+            break;
+        }
 #endif
+#ifdef __ANDROID__
         // Wait for the next graphics queue submission if necessary.
         std::unique_lock lk{m_submission_lock};
         m_submission_cv.wait(lk, stop_token, [this] {
             return (std::chrono::steady_clock::now() - m_submission_time) <=
                    std::chrono::milliseconds{100};
         });
+#endif
     }
 #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
     adrenotools_set_turbo(false);

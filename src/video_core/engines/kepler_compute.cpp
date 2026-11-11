@@ -22,6 +22,7 @@
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
+#include "video_core/duskbloods_upscale.h"
 #include "video_core/nx2_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -653,13 +654,15 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     // Fortune's Weave's DLSS evaluation runs from its first pass to the pass that writes the
     // upscaled image. Its inputs are kept from the first pass for a replacement upscale.
-    if (RememberDlssMotionVectors()) {
+    const bool input_pass = RememberDlssMotionVectors();
+    if (input_pass) {
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
         dlss_chain.pending.clear();
     }
     const bool output_pass = dlss_chain.active && IsDlssOutputPass();
+    const bool duskbloods = Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
     // Fortune's Weave's evaluation is 13 dispatches. Without an output pass by then, the first
     // pass was another program with a similar constant buffer: stop following it. Skipped
     // dispatches count too, so a chain always ends.
@@ -669,13 +672,17 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         dlss_chain.pending.clear();
     }
     const GPUVAddr program = regs.code_loc.Address();
+    if (duskbloods && output_pass) {
+        dlss_chain.pending.insert(program);
+        return FinishDlssEvaluation();
+    }
     if (dlss_chain.active) {
         // While the network can't be shown (it failed its checks, or it is off) the passes of
         // earlier evaluations stop running, and the replacement upscale draws the output at the
         // output pass.
         if ((dlss_chain.failure != VideoCore::GameDlssReason::None ||
              GameDlssBlocker() != VideoCore::GameDlssReason::None) &&
-            dlss_chain.programs.contains(program)) {
+            dlss_chain.programs.contains(program) && (!duskbloods || !input_pass)) {
             return output_pass ? FinishDlssEvaluation() : true;
         }
         dlss_chain.pending.insert(program);
@@ -905,6 +912,11 @@ constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
 // shaders 32 threads wide.
 VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
     using VideoCore::GameDlssReason;
+    // The captured Duskbloods network output faults on RADV; the replacement also avoids
+    // emulating the network's tensor-core passes on the host GPU.
+    if (Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL) {
+        return GameDlssReason::TurnedOff;
+    }
     static const bool forced_replacement = std::getenv("EDEN_NX2_DLSS_REPLACEMENT") != nullptr;
     if (forced_replacement) {
         return GameDlssReason::TurnedOff;
@@ -1220,8 +1232,12 @@ bool KeplerCompute::IsDlssOutputPass() {
         return GetTICEntry(tic_index);
     };
     const auto input = image(0x328), output = image(0x348);
+    const bool duskbloods = Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
     return input && output && input->Address() == dlss_motion_color && output->Address() != 0 &&
-           input->format == output->format && output->Width() > input->Width();
+           output->Address() != input->Address() && input->format == output->format &&
+           (output->Width() > input->Width() ||
+            (duskbloods && output->Width() == input->Width() &&
+             output->Height() >= input->Height()));
 }
 
 // Logs the images a rejected program's handles (constant bank 0, bytes 0x80-0x11c) point to, so a
@@ -1257,6 +1273,17 @@ std::atomic<u32> g_nx2_trace_draws_after_upscale{};
 bool KeplerCompute::RememberDlssMotionVectors() {
     const auto& cbuf = launch_description.const_buffer_config[0];
     if (cbuf.size.Value() < 0x294) return false;
+    const bool duskbloods = Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
+    if (duskbloods) {
+        const auto& stores = NativeImageHandles(regs.code_loc.Address()).second;
+        // The captured prepass writes motion plus two network inputs. Its other passes
+        // can retain the same constants, so those alone must not restart the evaluation.
+        for (const u32 offset : {0x290U, 0x2a4U, 0x2b0U}) {
+            if (std::ranges::find(stores, offset) == stores.end()) {
+                return false;
+            }
+        }
+    }
     const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
     const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
         const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
@@ -1266,14 +1293,16 @@ bool KeplerCompute::RememberDlssMotionVectors() {
     const auto color = image(0x278), motion = image(0x290);
     if (!color || !motion || color->format != Texture::TextureFormat::B10G11R11 ||
         motion->format != Texture::TextureFormat::R16G16 || motion->Address() == 0 ||
-        motion->Width() != color->Width() || motion->Height() != color->Height() ||
+        (!duskbloods && (motion->Width() != color->Width() || motion->Height() != color->Height())) ||
         !motion->IsBlockLinear())
         return false;
     dlss_motion_vectors = *motion;
     dlss_motion_color = color->Address();
-    const auto depth = cbuf.size.Value() >= 0x29c ? image(0x298) : std::nullopt;
-    if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
-        depth->Width() == color->Width() && depth->Height() == color->Height() &&
+    const auto depth = cbuf.size.Value() >= 0x29c ? image(duskbloods ? 0x288 : 0x298) : std::nullopt;
+    if (depth && (depth->format == Texture::TextureFormat::Z32 ||
+                  (duskbloods && depth->format == Texture::TextureFormat::S8Z24)) &&
+        depth->Address() != 0 &&
+        (duskbloods || (depth->Width() == color->Width() && depth->Height() == color->Height())) &&
         depth->IsBlockLinear()) {
         dlss_depth = *depth;
     } else {
@@ -1281,6 +1310,16 @@ bool KeplerCompute::RememberDlssMotionVectors() {
     }
     dlss_jitter = {std::bit_cast<f32>(memory_manager.Read<u32>(cbuf_address + 0x1b0)),
                    std::bit_cast<f32>(memory_manager.Read<u32>(cbuf_address + 0x1b4))};
+    if (duskbloods) {
+        static u32 reported{};
+        if (reported++ < 4) {
+            LOG_INFO(HW_GPU, "Duskbloods temporal inputs: color {}x{}, motion {}x{}, depth {} format {} {}x{}, jitter {}, {}",
+                     color->Width(), color->Height(), motion->Width(), motion->Height(),
+                     dlss_depth.has_value(), depth ? static_cast<u32>(depth->format.Value()) : 0,
+                     depth ? depth->Width() : 0, depth ? depth->Height() : 0,
+                     dlss_jitter[0], dlss_jitter[1]);
+        }
+    }
     return true;
 }
 
@@ -1384,6 +1423,31 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         output->Width() == 1920 && output->Height() == 1080;
     bool have_pair = upscale_pair(input, output, !starfox_conversion);
     bool fortunes_weave = false;
+    std::optional<std::array<u32, 2>> render_region;
+    const bool duskbloods = Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
+    if (duskbloods && cbuf.size.Value() >= 0x3a0 &&
+        memory_manager.IsFullyMappedRange(cbuf_address, 0x3a0)) {
+        input = image(0x328);
+        output = image(0x348);
+        if (input && output && input->Address() == dlss_motion_color &&
+            input->Address() != output->Address() && output->Address() != 0 &&
+            input->IsBlockLinear() && output->IsBlockLinear() &&
+            input->format == Texture::TextureFormat::B10G11R11 &&
+            output->format == Texture::TextureFormat::B10G11R11 && dlss_motion_vectors) {
+            render_region = VideoCommon::DuskbloodsUpscale::RenderRegion(
+                memory_manager.Read<u32>(cbuf_address + 0x39c),
+                memory_manager.Read<u32>(cbuf_address + 0x394),
+                {input->Width(), input->Height()}, {output->Width(), output->Height()},
+                {dlss_motion_vectors->Width(), dlss_motion_vectors->Height()});
+            if (!render_region) {
+                return false;
+            }
+            fortunes_weave = true;
+            have_pair = true;
+        } else {
+            return false;
+        }
+    }
     if (!have_pair) {
         input = image(0x328);
         output = image(0x348);
@@ -1512,8 +1576,8 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         .dst_y1 = static_cast<s32>(output->Height()),
         .src_x0 = 0,
         .src_y0 = 0,
-        .src_x1 = static_cast<s32>(input->Width()),
-        .src_y1 = static_cast<s32>(input->Height()),
+        .src_x1 = static_cast<s32>(render_region ? (*render_region)[0] : input->Width()),
+        .src_y1 = static_cast<s32>(render_region ? (*render_region)[1] : input->Height()),
     };
     // Debug: does the input hold anything? Download it once and count non-zero words.
     static const u32 sample_at = [] {
@@ -1590,14 +1654,22 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
             return false;
         Fermi2D::Surface motion = surface(*dlss_motion_vectors);
         motion.format = RTFormat::R16G16_FLOAT;
+        // Fortune's Weave's prepass stores UV offsets to the previous position. The Duskbloods'
+        // has applied the game's own scale (cbuf0+0x198, minus the output height on both axes),
+        // which leaves offsets in output pixels.
+        const auto motion_scale =
+            duskbloods ? std::array{1.0f / static_cast<f32>(output->Width()),
+                                    1.0f / static_cast<f32>(output->Height())}
+                       : std::array{1.0f, 1.0f};
         return rasterizer->AccelerateTemporalUpscale(source, surface(*output), motion,
                                                      dlss_depth ? &*dlss_depth : nullptr,
-                                                     dlss_jitter, {1.0f, 1.0f});
+                                                     dlss_jitter, motion_scale, render_region);
     };
     if (shared_exponent_input) {
         VideoCommon::g_blit_source_format = VideoCore::Surface::PixelFormat::E5B9G9R9_FLOAT;
     }
-    const bool done = upscale_temporally() ||
+    const bool temporal = upscale_temporally();
+    const bool done = temporal ||
                       rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
     VideoCommon::g_blit_source_format.reset();
     if (static u32 checked{}; checked++ == sample_at) {
@@ -1630,7 +1702,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
                  input->block_height.Value(), input->block_depth.Value(), output->Address(),
                  output->Width(), output->Height(), output->block_width.Value(),
                  output->block_height.Value(), output->block_depth.Value(), output->max_mip_level.Value(),
-                 done ? "blitted" : "not accelerated");
+                 temporal ? "temporal" : done ? "bilinear copy" : "not accelerated");
     }
     return done;
 }

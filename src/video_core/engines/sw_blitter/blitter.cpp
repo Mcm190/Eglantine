@@ -209,6 +209,18 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                               Fermi2D::Config& config) {
     const auto get_surface_size = [](Fermi2D::Surface& surface, u32 bytes_per_pixel) {
         if (surface.linear == Fermi2D::MemoryLayout::BlockLinear) {
+            if (surface.depth > 1) {
+                // A blit reaches one slice, the first at the surface's address: a game copies a
+                // volume slice by slice and passes each slice's address. That slice ends before
+                // the last block's other slices, which belong to whatever follows the volume
+                // when the address is a later slice's, so they are neither read nor written back.
+                const size_t first_block = CalculateSize(true, bytes_per_pixel, surface.width,
+                                                         surface.height, 1, surface.block_height,
+                                                         surface.block_depth);
+                const size_t other_slices = ((size_t{1} << surface.block_depth) - 1)
+                                            << (GOB_SIZE_SHIFT + surface.block_height);
+                return first_block - other_slices;
+            }
             return CalculateSize(true, bytes_per_pixel, surface.width, surface.height,
                                  surface.depth, surface.block_height, surface.block_depth);
         }

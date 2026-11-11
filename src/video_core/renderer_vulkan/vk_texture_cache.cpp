@@ -1644,6 +1644,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         .depth = depth.DepthView(),
         .motion_vectors = motion_vectors.Handle(Shader::TextureType::Color2D),
         .render_size = {render_size[0], render_size[1]},
+        .max_render_size = {input_color.size.width, input_color.size.height},
         .upscale_size = extent,
         .jitter = jitter,
         .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
@@ -1999,7 +2000,7 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                       *temporal_history.views[read_index],
                                       *temporal_history.views[write_index], dst_region, jitter,
                                       motion_scale, reset ? 1.0f : current_weight, kernel_scale,
-                                      clip_width, clip_motion, kernel_motion);
+                                      clip_width, clip_motion, kernel_motion, render_size);
     // RCAS on the output, set by the FSR sharpness slider (stops as FSR takes them, 0% = stored 200
     // turns it off). It reads the unsharpened result just stored, which stays the history.
     // EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off overrides the slider.

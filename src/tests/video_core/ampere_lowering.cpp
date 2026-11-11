@@ -331,6 +331,26 @@ TEST_CASE("Ampere gathers take arrays, per-pixel offsets and depth references",
     REQUIRE(tld4b_aoffi != 0);
     CHECK(field(tld4b_aoffi, 20, 8) == 246);
     CHECK(field(tld4b_aoffi, 36, 2) == 1);
+
+    // The Duskbloods: TLD4.R.AOFFI R8, R2, R9 with the handle in UR4. x, y in R2, R3, the packed
+    // offset in R9 goes to R247, after the handle in R246.
+    const auto bindless_aoffi = lower({{0x02087f63, 0x30000409, 0x081e15ff, 0x000f4200}});
+    INFO(bindless_aoffi.error);
+    REQUIRE(static_cast<bool>(bindless_aoffi));
+    REQUIRE(bindless_aoffi.instructions.size() >= 5);
+    CHECK(field(bindless_aoffi.instructions[0], 20, 8) == 2);
+    CHECK(field(bindless_aoffi.instructions[1], 20, 8) == 3);
+    CHECK(field(bindless_aoffi.instructions[2], 0, 8) == 247);
+    CHECK(field(bindless_aoffi.instructions[2], 20, 8) == 9);
+    CHECK(field(bindless_aoffi.instructions[3], 0, 8) == 246);
+    CHECK(field(bindless_aoffi.instructions[3], 20, 8) == 220);
+    const u64 tld4b_bindless = FindMaxwell(bindless_aoffi, 0xde, 56);
+    REQUIRE(tld4b_bindless != 0);
+    CHECK(field(tld4b_bindless, 20, 8) == 246);
+    CHECK(field(tld4b_bindless, 31, 4) == 5);
+    CHECK(field(tld4b_bindless, 36, 2) == 1);
+    // Per-pixel offsets with a uniform handle stay rejected.
+    CHECK_FALSE(lower({{0x02087f63, 0x30000409, 0x081e25ff, 0x000f4200}}));
 }
 
 TEST_CASE("Ampere Ocarina sign extends, uniform shifts and carries, LEA.HI and SURED forms",
@@ -498,5 +518,66 @@ TEST_CASE("Ampere three-input IADD3 retains register source negation", "[video_c
     CHECK(((adds[0] >> 48) & 1) == 1);
     CHECK(((adds[0] >> 49) & 1) == 1);
     CHECK(((adds[1] >> 48) & 1) == 1);
+}
+TEST_CASE("Duskbloods bindless surface stores preserve their image contract", "[ampere][duskbloods]") {
+    const Instruction store{{0x0000799c, 0x6000000c, 0x00100f04, 0x004fe200}};
+    const auto lowered = LowerToMaxwell(std::array{store, EXIT});
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 word = FindMaxwell(lowered, 0xeb2, 52);
+    REQUIRE(word != 0);
+    CHECK((word & 0xff) == 12);
+    CHECK(((word >> 8) & 0xff) == 0);
+    CHECK(((word >> 20) & 0xf) == 15);
+    CHECK(((word >> 33) & 7) == 3);
+    CHECK(((word >> 39) & 0xff) == 4);
+    CHECK(((word >> 51) & 1) == 0);
+    CHECK(lowered.required_texture_buffer == ~0U);
+
+    auto invalid = store;
+    invalid.words[2] = 0x00100504; // Non-contiguous store mask is not supported here.
+    CHECK_FALSE(LowerToMaxwell(std::array{invalid, EXIT}));
+    invalid = store;
+    invalid.words[1] = 0x4000000c; // Unsupported image dimension.
+    CHECK_FALSE(LowerToMaxwell(std::array{invalid, EXIT}));
+}
+
+TEST_CASE("Duskbloods bindless volume loads retain their descriptor and dimensions", "[ampere][duskbloods]") {
+    const Instruction load{{0x100c7998, 0xa0000000, 0x001e0f01, 0x010f6400}};
+    const auto lowered = LowerToMaxwell(std::array{load, EXIT});
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 word = FindMaxwell(lowered, 0xeb0, 52);
+    REQUIRE(word != 0);
+    CHECK((word & 0xff) == 12);
+    CHECK(((word >> 8) & 0xff) == 16);
+    CHECK(((word >> 20) & 0xf) == 15);
+    CHECK(((word >> 33) & 7) == 5);
+    CHECK(((word >> 39) & 0xff) == 1);
+    CHECK(((word >> 51) & 1) == 0);
+
+    auto invalid = load;
+    invalid.words[0] += 1U << 16; // Four-channel loads require an aligned result quartet.
+    CHECK_FALSE(LowerToMaxwell(std::array{invalid, EXIT}));
+}
+
+TEST_CASE("Duskbloods uniform local spill and U64 left funnel lower", "[ampere][duskbloods]") {
+    const Instruction spill{{0xff047983, 0x0000c018, 0x08100a00, 0x008ea800}};
+    const auto loaded = LowerToMaxwell(std::array{spill, EXIT});
+    REQUIRE(static_cast<bool>(loaded));
+    const u64 word = FindMaxwell(loaded, 0xef4, 52);
+    REQUIRE(word != 0);
+    CHECK((word & 0xff) == 4);
+    CHECK(((word >> 8) & 0xff) == 242); // UR24's uniform mirror.
+    CHECK(((word >> 20) & 0xffffff) == 0xc0);
+    CHECK(CountMaxwell(loaded, 0xef4, 52) == 2);
+
+    const Instruction shift{{0x03017819, 0x00000004, 0x00010202, 0x000fe400}};
+    const auto shifted = LowerToMaxwell(std::array{shift, EXIT});
+    REQUIRE(static_cast<bool>(shifted));
+    const u64 funnel = FindMaxwell(shifted, 0x36f8, 48);
+    REQUIRE(funnel != 0);
+    CHECK((funnel & 0xff) == 1);
+    CHECK(((funnel >> 8) & 0xff) == 3);
+    CHECK(((funnel >> 20) & 0x7ffff) == 4);
+    CHECK(((funnel >> 39) & 0xff) == 2);
 }
 } // namespace

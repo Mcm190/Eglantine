@@ -44,8 +44,16 @@ struct LoweredProgram {
     explicit operator bool() const { return error.empty(); }
 };
 
+enum class TessellationStage {
+    None,
+    Control,
+    Evaluation,
+};
+
 struct LoweringOptions {
     bool geometry{};
+    /// The program is a tessellation control or evaluation stage: admits patch attribute access.
+    TessellationStage tessellation_stage{TessellationStage::None};
     /// Lower matrix multiplies (HMMA) too; see LowerToMaxwellWith.
     bool tensor{};
     /// With `tensor`: lower each HMMA to one call of a shared software helper instead of the
@@ -150,8 +158,15 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
         operand(opcode == 0x984 ? 16 : 32, count); operand(24); break;
     }
-    case 0x387: case 0x983:
-        operand(opcode == 0x387 ? 32 : 16); operand(24); break;
+    case 0x387: case 0x983: case 0x987: {
+        const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
+        operand(opcode == 0x983 ? 16 : 32, count); operand(24); break;
+    }
+    case 0x998: case 0x99c:
+        operand(opcode == 0x998 ? 16 : 32, std::popcount(input.Bits(72, 4)));
+        operand(24, input.Bits(61, 3) >= 4 ? 3 : 2);
+        operand(64);
+        break;
     case 0x981: case 0x986: {
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
         operand(opcode == 0x981 ? 16 : 32, count);
@@ -255,6 +270,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
 // native bytes. Scheduling/control words are added by the environment adapter.
 inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 high_uniforms,
                                           LoweringOptions options = {}) {
+    const auto tessellation_stage = options.tessellation_stage;
     const bool geometry = options.geometry, tensor = options.tensor,
                compact_tensor = options.compact_tensor;
     LoweredProgram result;
@@ -276,6 +292,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
     for (const auto& instruction : code) {
         const u32 op = instruction.Bits(0, 12);
         uses_uniform_bank |= op == 0x4a4 || op == 0x2bf || op == 0x499;
+        uses_uniform_bank |= op == 0x987 ||
+            ((op == 0x387 || op == 0x983) && instruction.Bits(91, 1));
         uses_uniform_bank |= op == 0x3c4 || op == 0x2bd || op == 0x896 || op == 0xf60 || op == 0xc11 || op == 0xd08 || op == 0xc0c || op == 0x986 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xe23 || op == 0xc02 ||
                              op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || (op == 0x988 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0xf63 || op == 0xf66 || op == 0xf69 || op == 0xc0b || op == 0x8a5 || op == 0x299 || op == 0xc09 || op == 0xc07 || op == 0xf6c || (op == 0x81c && instruction.Bits(67, 1)) || op == 0xc0a ||
                              (op == 0x83b && instruction.Bits(91, 1)) ||
@@ -1486,6 +1504,26 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{1} << 48));
             break;
         }
+        case 0x998: case 0x99c: { // SULD.P / SUST.P, register descriptor.
+            const bool store = opcode == 0x99c;
+            const u32 data = insn.Bits(store ? 32 : 16, 8);
+            const u32 coordinate = insn.Bits(24, 8), handle = insn.Bits(64, 8);
+            const u32 channels = insn.Bits(72, 4), dimension = insn.Bits(61, 3);
+            const u32 count = static_cast<u32>(std::popcount(channels));
+            const u32 reserved = uses_uniform_bank ? high_uniform_base : 246U;
+            if ((insn.words[1] & ~(store ? 0xe00000ffU : 0xe0000000U)) ||
+                (insn.words[2] & ~0xfffU) != (store ? 0x00100000U : 0x001e0000U) ||
+                (insn.words[3] & 0xc00001ffU) || dimension < 3 || dimension > 5 ||
+                channels == 0 || handle >= reserved || data + count > reserved ||
+                coordinate + (dimension >= 4 ? 3U : 2U) > reserved ||
+                (store && (dest != 0 || (channels != 1 && channels != 3 && channels != 15))) ||
+                (!store && (data % (count == 3 ? 4U : count))))
+                return fail(index, "native bindless formatted surface mode");
+            emit((store ? 0xeb20000000000000ULL : 0xeb00000000000000ULL) | predicate |
+                data | (u64{coordinate} << 8) | (u64{channels} << 20) |
+                (u64{dimension} << 33) | (u64{handle} << 39));
+            break;
+        }
         case 0xb97: { // SULD.P.2D/2D_ARRAY/3D.IGN, direct descriptor, channel mask at 72-75.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 coordinate = insn.Bits(24, 8);
@@ -2511,7 +2549,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0xb63: case 0xf63: { // TLD4 (gather), 2D or 2D array; component at bits 87-88.
-            // 0xf63: the handle in a uniform register (bit 91), Maxwell TLD4.B with the handle in Rb.
+            // 0xf63: the handle in a uniform register (bit 91), Maxwell TLD4.B with the handle in Rb
+            // and a packed offset (AOFFI) after it.
             const bool bindless = opcode == 0xf63;
             const u32 handle = bindless ? uniform_register(insn.Bits(40, 6)) : 255;
             const u32 mask = insn.Bits(72, 4), second_dest = insn.Bits(64, 8);
@@ -2530,7 +2569,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 in_b = meta ? meta : coordinates - in_a;
             if ((insn.Bits(61, 3) != 1 && !array) || offset_mode == 3 || insn.Bits(79, 1) ||
                 insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
-                (bindless && (offset_mode || depth)) ||
+                (bindless && (offset_mode == 2 || depth)) ||
                 (offset_mode && source_b == 255) ||
                 (source_a != 255 &&
                  source_a + in_a > ((array || meta) ? shadow_boundary : 246U)) || (source_b != 255 && source_b + in_b > 246) ||
@@ -2609,7 +2648,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         break;
                     }
                 }
-                const u32 meta_reg = 246 + (second_buffer ? 1U : 0U) + i;
+                const u32 meta_reg = 246 + ((second_buffer || bindless) ? 1U : 0U) + i;
                 if (imm) {
                     emit(0x010000000007f000ULL | meta_reg | (u64{*imm} << 20));
                 } else {
@@ -2625,8 +2664,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             } else if (bindless) {
                 emit(0x5c98000000000000ULL | predicate | 246 | (u64{15} << 39) | (u64{handle} << 20));
                 emit(0xdec0000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
-                     (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) | (u64{insn.Bits(87, 2)} << 38) |
-                     (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
+                     (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) | (u64{offset_mode} << 36) |
+                     (u64{insn.Bits(87, 2)} << 38) | (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
             } else {
             emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
                  (u64{meta ? 246U : 255U} << 20) | (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) |
@@ -2846,9 +2885,23 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x321: // ALD
         case 0x322: { // AST
-            if (insn.Bits(76, 2) || insn.Bits(79, 1)) return fail(index, "native indexed/patch attribute access");
+            // Bit 76: per-patch attribute, 79: .O (the stage's outputs). A control stage reads its
+            // own patch outputs back and writes them; an evaluation stage reads the patch inputs
+            // and the tessellation coordinate (output space a[0x2f0], U and V).
+            const bool patch = insn.Bits(76, 1) != 0;
+            const bool output = insn.Bits(79, 1) != 0;
             const u32 address = insn.Bits(40, 10);
             const u32 components = insn.Bits(74, 2) + 1;
+            const bool tessellation_coordinates =
+                tessellation_stage == TessellationStage::Evaluation && opcode == 0x321 &&
+                !patch && address >= 0x2f0 && address + components * 4 <= 0x2f8;
+            if (insn.Bits(77, 1) || (patch && tessellation_stage == TessellationStage::None) ||
+                (output && ((!patch && !tessellation_coordinates) || opcode != 0x321)) ||
+                (patch && opcode == 0x321 &&
+                 output != (tessellation_stage == TessellationStage::Control)) ||
+                (patch && opcode == 0x322 && tessellation_stage != TessellationStage::Control)) {
+                return fail(index, "native indexed/patch attribute access");
+            }
             if (address % 4 || address + components * 4 > 0x400 || insn.Bits(24, 8) != 255) {
                 return fail(index, "native attribute address or indexing");
             }
@@ -2866,23 +2919,47 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 vertex = opcode == 0x321 ? insn.Bits(32, 8) : insn.Bits(64, 8);
             const u64 translated = (opcode == 0x321 ? 0xefd8000000000000ULL : 0xeff0000000000000ULL) |
                 predicate | value_reg | (u64{255} << 8) | (u64{address} << 20) |
+                (u64{patch} << 31) | (u64{output} << 32) |
                 (u64{vertex} << 39) | (u64{components - 1} << 47);
             result.instructions.push_back(translated);
             break;
         }
-        case 0x387: case 0x983: { // Local spill at [Ra + immediate byte offset].
+        case 0x387: case 0x983: case 0x987: { // Local spill at [Ra + UR + immediate].
             // The size is bits 73-75 (0-3 = U8, S8, U16, S16, then 4, 5, 6 = 32, 64, 128 bits), as
             // Maxwell's; wider accesses become 32-bit ones. A load's bit 85 (.LU) is a cache hint.
-            const bool store = opcode == 0x387;
+            const bool store = opcode != 0x983;
             const u32 size = insn.Bits(73, 3);
-            const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24), address = insn.Bits(24, 8);
+            const bool uniform_address = insn.Bits(91, 1) != 0;
+            const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24);
+            u32 address = insn.Bits(24, 8);
             const u32 words = size == 6 ? 4 : size == 5 ? 2 : 1, value = store ? data : static_cast<u32>(dest);
             const u32 alignment = size < 2 ? 1U : size < 4 ? 2U : 4U;
-            if ((address != 255 && address >= 246) || (store && insn.Bits(16, 8)) || (!store && data) ||
-                (value != 255 && (value + words > 248 || (value & (words - 1)))) || (!store && value == 255) ||
-                (offset & (alignment - 1)) || offset + 4 * words > 0x800000 || size > 6 ||
-                (insn.words[2] & ~(store ? 0xe00U : 0x200e00U)) != 0x00100000U)
+            const u32 register_limit = uses_uniform_bank ? high_uniform_base : 246U;
+            const u32 value_limit = uses_uniform_bank ? high_uniform_base : 248U;
+            const u32 allowed = (store ? 0xe00U : 0x200e00U) |
+                (uniform_address ? 0x08000000U | (store ? 0x3fU : 0U) : 0U);
+            if ((address != 255 && address >= register_limit) || (store && insn.Bits(16, 8)) ||
+                (!store && data && !uniform_address) ||
+                (value != 255 && (value + words > value_limit || (value & (words - 1)))) ||
+                (!store && value == 255) || (opcode == 0x987 && !uniform_address) ||
+                (offset & (alignment - 1)) || offset + alignment * words > 0x800000 || size > 6 ||
+                (insn.words[2] & ~allowed) != 0x00100000U)
                 return fail(index, "native local scalar spill mode");
+            if (uniform_address) {
+                const u32 uniform = uniform_register(store ? insn.Bits(64, 6) : data);
+                if (uniform == ~0U) return fail(index, "native local spill uniform address");
+                if (address == 255) {
+                    address = uniform;
+                } else if (uniform != 255) {
+                    emit(0x5c10000000000000ULL | predicate | 252 | (u64{uniform} << 8) |
+                         (u64{address} << 20));
+                    address = 252;
+                }
+            }
+            if (uniform_address && !store && words > 1 && address >= value && address < value + words) {
+                emit(0x5c98000000000000ULL | predicate | 252 | (u64{15} << 39) | (u64{address} << 20));
+                address = 252;
+            }
             for (u32 word = 0; word < words; ++word)
                 emit((store ? 0xef50000000000000ULL : 0xef40000000000000ULL) | predicate |
                      (value == 255 ? 255U : value + word) | (u64{address} << 8) |
@@ -3295,7 +3372,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 emit(base(0x3828000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.words[1]} << 20));
                 break;
             }
-            if ((insn.Bits(73, 2) != 3 && !is_signed) || insn.Bits(75, 1) || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
+            const bool u64_left = insn.Bits(73, 2) == 1 && !insn.Bits(76, 1);
+            if ((insn.Bits(73, 2) != 3 && !is_signed && !u64_left) || insn.Bits(75, 1) || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
             const u32 low = insn.Bits(24, 8), high = insn.Bits(64, 8), shift = insn.words[1];
             if (insn.Bits(76, 1)) {
                 if (low != 255) return fail(index, "native nonzero low right-shift word");
@@ -3763,11 +3841,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Kept as an nx2 pseudo instruction (Maxwell 0xefc0, free there) that the frontend
             // reads for the task or mesh stage: data/dest 0-7, Ra 8-15, offset 20-43, .32 44,
             // .ATTR 45, .SKEW 46, .O 47, write 48. Addresses are linear bytes in the region.
-            if (geometry) {
+            if (geometry || tessellation_stage != TessellationStage::None) {
                 // A vertex's stage buffer entry, which only ALD reads: Ra passes through, as
                 // Maxwell's ISBERD does.
                 if (opcode != 0x923 || insn.Bits(75, 5) || insn.Bits(40, 24))
-                    return fail(index, "native geometry ISBERD mode");
+                    return fail(index, tessellation_stage != TessellationStage::None
+                                           ? "native tessellation ISBERD mode"
+                                           : "native geometry ISBERD mode");
                 if (dest != 255) {
                     emit(base(0x5c98000000000000ULL) | (u64{15} << 39) | (u64{insn.Bits(24, 8)} << 20));
                 }

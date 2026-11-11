@@ -410,7 +410,7 @@ void Fsr3Upscaler::CreateResources(VkExtent2D render_size, VkExtent2D upscale_si
     lanczos_lut = CreateTexture(VK_FORMAT_R16_SNORM, 128, 1);
     default_reactive = CreateTexture(VK_FORMAT_R8_UNORM, 1, 1);
     output = CreateTexture(VK_FORMAT_R16G16B16A16_SFLOAT, uw, uh);
-    render_extent = render_size;
+    allocated_extent = render_size;
     upscale_extent = upscale_size;
     first_execution = true;
     frame_parity = 0;
@@ -418,15 +418,19 @@ void Fsr3Upscaler::CreateResources(VkExtent2D render_size, VkExtent2D upscale_si
 }
 
 void Fsr3Upscaler::Upscale(const Inputs& in) {
-    if (!output.image || in.render_size.width != render_extent.width ||
-        in.render_size.height != render_extent.height ||
-        in.upscale_size.width != upscale_extent.width ||
-        in.upscale_size.height != upscale_extent.height) {
+    // A game with dynamic resolution changes its render size from frame to frame: the images are
+    // allocated for the largest one (FSR's maximum render size) and keep their history.
+    const VkExtent2D needed{(std::max)(in.render_size.width, in.max_render_size.width),
+                            (std::max)(in.render_size.height, in.max_render_size.height)};
+    if (!output.image || in.upscale_size.width != upscale_extent.width ||
+        in.upscale_size.height != upscale_extent.height ||
+        needed.width > allocated_extent.width || needed.height > allocated_extent.height) {
         if (output.image) {
             scheduler.Finish(); // the old images may still be in use
         }
-        CreateResources(in.render_size, in.upscale_size);
+        CreateResources(needed, in.upscale_size);
     }
+    render_extent = in.render_size;
     const bool first = first_execution;
     const bool reset = in.reset || first;
     first_execution = false;
@@ -442,7 +446,8 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
     constants.previous_render_size = first ? constants.render_size : previous_render_size;
     constants.upscale_size = {uw, uh};
     constants.previous_upscale_size = first ? constants.upscale_size : previous_upscale_size;
-    constants.max_render_size = constants.render_size;
+    constants.max_render_size = {static_cast<s32>(allocated_extent.width),
+                                 static_cast<s32>(allocated_extent.height)};
     constants.max_upscale_size = constants.upscale_size;
     {
         // Reversed infinite depth (setupDeviceDepthToViewSpaceDepthParams with near = FLT_MAX).

@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/ocarina_upscale.h"
+#include "video_core/duskbloods_upscale.h"
 
 namespace {
 namespace Ocarina = VideoCommon::OcarinaUpscale;
@@ -145,4 +146,27 @@ TEST_CASE("Ocarina upscale rejects a singular camera", "[ocarina_upscale]") {
     const auto screen = Ocarina::ScreenMatrix(Viewport, ViewProjection(0.0, {0.0, 0.0, 0.0}));
     REQUIRE_FALSE(Ocarina::Reprojection(screen, Ocarina::Matrix{}));
     REQUIRE(Ocarina::Invert(Ocarina::Multiply(screen, *Ocarina::Invert(screen))));
+}
+
+TEST_CASE("Duskbloods upscale uses the rendered region inside differently sized targets",
+          "[duskbloods][upscale]") {
+    using VideoCommon::DuskbloodsUpscale::RenderRegion;
+    const auto handheld = RenderRegion(1279, 719, {1920, 1080}, {1920, 1080}, {1536, 864});
+    REQUIRE(handheld);
+    CHECK(*handheld == std::array<u32, 2>{1280, 720});
+    const auto docked = RenderRegion(1919, 1079, {1920, 1080}, {1920, 1080}, {1920, 1080});
+    REQUIRE(docked);
+    CHECK(*docked == std::array<u32, 2>{1920, 1080});
+}
+
+TEST_CASE("Duskbloods upscale rejects regions exceeding any backing target",
+          "[duskbloods][upscale]") {
+    using VideoCommon::DuskbloodsUpscale::RenderRegion;
+    CHECK_FALSE(RenderRegion(1536, 719, {1920, 1080}, {1920, 1080}, {1536, 864}));
+    CHECK_FALSE(RenderRegion(1279, 864, {1920, 1080}, {1920, 1080}, {1536, 864}));
+    CHECK_FALSE(RenderRegion(1279, 719, {1279, 1080}, {1920, 1080}, {1536, 864}));
+    CHECK_FALSE(RenderRegion(1279, 719, {1920, 1080}, {1920, 719}, {1536, 864}));
+    CHECK_FALSE(RenderRegion(~0U, 719, {1920, 1080}, {1920, 1080}, {1536, 864}));
+    CHECK_FALSE(RenderRegion(1279, ~0U, {1920, 1080}, {1920, 1080}, {1536, 864}));
+    CHECK_FALSE(RenderRegion(0, 0, {0, 0}, {1920, 1080}, {1536, 864}));
 }

@@ -69,8 +69,10 @@ add_executable(tests
     video_core/vertex_repack.cpp
     video_core/virtual_range_cache.cpp
     video_core/ampere_lowering.cpp
+    video_core/turbo_mode_pacer.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
+    video_core/ampere_tennis_tessellation.cpp
     video_core/ampere_i2f.cpp
     video_core/ampere_gradient.cpp
     video_core/ampere_returns.cpp
@@ -95,6 +97,11 @@ add_executable(tests
 create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core input_common video_core)
+
+if (ENABLE_MCP_SERVER)
+    target_sources(tests PRIVATE mcp/protocol.cpp)
+    target_link_libraries(tests PRIVATE mcp)
+endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 add_test(NAME tests COMMAND tests)

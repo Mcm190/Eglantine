@@ -1,0 +1,11 @@
+{
+ "title": "0400D1D02399A000",
+ "game": "The Duskbloods: Network Test",
+ "notes": "",
+ "programs": [
+  {"key": "50e47e31c31fc1f8", "stage": "compute", "object": "DLSS final upscale output", "group": "Upscaling", "how": "RADV main-device hang capture: color input +0x328 and image outputs +0x348/+0x350; matched the captured program and Lichii replacement.", "notes": "The working replacement scales the render region and uses reversed motion vectors.", "updated": "2026-11-11T09:51:48Z"},
+  {"key": "e5efe04581720f15", "stage": "compute", "object": "DLSS motion and network prepass", "group": "Upscaling", "how": "Captured stores at cbuf0+0x290, +0x2a4 and +0x2b0; matches the working Lichii duskbloods prepass.", "updated": "2026-11-11T09:51:48Z"},
+  {"key": "68a84477c245d545", "hash": "4ad8bad52372f667", "object": "Compute: 5-tap blur of the half-resolution RGBA16F mip chain (960x540 down to 30x16), three dispatches a level; divides by the sum of five weights from constant buffer 1 (0x68 to 0xa8). Source of green patches and NaN in a test match", "how": "Debug server frame capture (NaN and infinity in its outputs, only G and A filled), then reject_shaders: the green patch went away", "updated": "2026-11-11T16:17:22Z"},
+  {"key": "11557bcbef0882c4", "hash": "3c697c39d2f9616b", "object": "Compute: downsample step of the same half-resolution RGBA16F mip chain", "how": "Debug server frame capture: one dispatch a level, between the blur dispatches", "updated": "2026-11-11T16:17:22Z"}
+ ]
+}

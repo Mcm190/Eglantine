@@ -1462,9 +1462,19 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Engines::Fermi2D::Surface& src,
                                       const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                       const Tegra::Texture::TICEntry* depth,
-                                      std::array<f32, 2> jitter, std::array<f32, 2> motion_scale) {
-    if constexpr (FRAMEBUFFER_BLITS) {
+                                      std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
+                                      std::optional<std::array<u32, 2>> render_region) {
+    const auto unavailable = [&](const char* reason) {
+        static std::atomic<u32> reported{};
+        if (render_region && reported.fetch_add(1) < 4) {
+            LOG_WARNING(Render_Vulkan, "DLSS temporal upscale unavailable: {} (color {}x{}, motion {}x{}, output {}x{}, region {}x{})",
+                        reason, src.width, src.height, motion_vectors.width, motion_vectors.height,
+                        dst.width, dst.height, (*render_region)[0], (*render_region)[1]);
+        }
         return false;
+    };
+    if constexpr (FRAMEBUFFER_BLITS) {
+        return unavailable("framebuffer blits");
     } else {
         const Tegra::Engines::Fermi2D::Config copy{
             .operation = Tegra::Engines::Fermi2D::Operation::SrcCopy,
@@ -1481,7 +1491,7 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         };
         const auto result = GetBlitImages(dst, src, copy);
         if (!result) {
-            return false;
+            return unavailable("color image lookup");
         }
         const ImageInfo motion_info(motion_vectors);
         has_deleted_images = false;
@@ -1491,10 +1501,11 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         // it the stand-in runs.
         ImageId depth_id{};
         if (depth && motion_id && runtime.WantsTemporalUpscaleDepth()) {
-            depth_id = FindOrInsertImage(ImageInfo(*depth), depth->Address(), RelaxedOptions{});
+            const auto header = TextureViewHeader(*depth, gpu_memory->UsesNativeTiling());
+            depth_id = FindOrInsertImage(ImageInfo(header), depth->Address(), RelaxedOptions{});
         }
         if (has_deleted_images || !motion_id) {
-            return false; // the colour and output ids may be stale; the caller blits instead
+            return unavailable("motion/depth image lookup invalidated color images");
         }
         const ImageId dst_id = result->dst_id;
         const ImageId src_id = result->src_id;
@@ -1503,14 +1514,15 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         PrepareImage(dst_id, true, false);
         if (depth_id) {
             PrepareImage(depth_id, false, false);
+            const auto type = GetFormatType(slot_images[depth_id].info.format);
             if (slot_images[depth_id].info.num_samples != 1 ||
-                slot_images[depth_id].info.format != PixelFormat::D32_FLOAT) {
+                (type != SurfaceType::Depth && type != SurfaceType::DepthStencil)) {
                 depth_id = {};
             }
         }
         for (const ImageId id : {src_id, motion_id, dst_id}) {
             if (slot_images[id].info.num_samples != 1) {
-                return false;
+                return unavailable("multisampled image");
             }
         }
         // With resolution scaling, bring the images that can follow to the same scale, as BlitImage
@@ -1531,7 +1543,21 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                          rescaled(motion_id) != rescaled(src_id))) {
             depth_id = {};
         }
-        const Extent3D src_size = slot_images[src_id].info.size;
+        Extent3D src_size = slot_images[src_id].info.size;
+        if (render_region) {
+            const auto [width, height] = *render_region;
+            const auto& motion_size = slot_images[motion_id].info.size;
+            if (width == 0 || height == 0 || width > src_size.width || height > src_size.height ||
+                width > motion_size.width || height > motion_size.height) {
+                return unavailable("render region exceeds image");
+            }
+            src_size.width = width;
+            src_size.height = height;
+            if (depth_id && (width > slot_images[depth_id].info.size.width ||
+                             height > slot_images[depth_id].info.size.height)) {
+                depth_id = {};
+            }
+        }
         const std::array<u32, 2> render_size =
             rescaled(src_id)
                 ? std::array{Settings::values.resolution_info.ScaleUp(src_size.width),
@@ -1555,14 +1581,15 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         const auto motion_view = view(motion_id, motion_vectors, motion_info.format);
         const auto dst_view = view(dst_id, dst, result->dst_format);
         if (!src_view || !motion_view || !dst_view) {
-            return false;
+            return unavailable("image view lookup");
         }
         ImageViewId depth_view{};
         if (depth_id) {
             if (const std::optional base = slot_images[depth_id].TryFindBase(depth->Address())) {
                 const SubresourceRange range{.base = *base, .extent = {1, 1}};
                 depth_view = FindOrEmplaceImageView(
-                    depth_id, ImageViewInfo(ImageViewType::e2D, PixelFormat::D32_FLOAT, range));
+                    depth_id, ImageViewInfo(ImageViewType::e2D, slot_images[depth_id].info.format,
+                                            range));
             }
         }
         // After the views: creating them may reallocate the framebuffer slots.

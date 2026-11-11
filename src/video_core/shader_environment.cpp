@@ -550,6 +550,11 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     }
     auto lowered = Shader::Ampere::LowerToMaxwell(
         native, {.geometry = geometry,
+                 .tessellation_stage = stage == Shader::Stage::TessellationControl
+                                           ? Shader::Ampere::TessellationStage::Control
+                                       : stage == Shader::Stage::TessellationEval
+                                           ? Shader::Ampere::TessellationStage::Evaluation
+                                           : Shader::Ampere::TessellationStage::None,
                  .tensor = native_tensor,
                  .compact_tensor = native_compact_tensor,
                  .native_code_address = program_base + native_header_size});
@@ -729,8 +734,14 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                          (program == Maxwell::ShaderType::VertexB ||
                           program == Maxwell::ShaderType::Tessellation)};
     if (native) {
+        // Tessellation control and evaluation programs, told from a mesh program in the same slot
+        // by the header's own stage.
+        const bool tessellation =
+            (program == Maxwell::ShaderType::TessellationInit ||
+             program == Maxwell::ShaderType::Tessellation) &&
+            sph.common0.shader_type == static_cast<u32>(program);
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
-            !mesh_slot && !geometry) {
+            !mesh_slot && !geometry && !tessellation) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
@@ -743,7 +754,6 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                 dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             }
         }
-        InitializeNativeCode(std::move(lowered_native_), 128, geometry);
     }
     gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
     switch (program) {
@@ -788,6 +798,10 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                    geometry_pipeline.reserved[1]};
             gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
         }
+    }
+    if (native) {
+        // After the stage is known: the lowering depends on it.
+        InitializeNativeCode(std::move(lowered_native_), 128, geometry);
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());
