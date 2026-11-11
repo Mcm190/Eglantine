@@ -6,6 +6,9 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
+configure_file("${PROJECT_SOURCE_DIR}/tools/nx2/duskbloods_server.py"
+               "${CMAKE_BINARY_DIR}/bin/duskbloods_server.py" COPYONLY)
+
 # Set the RPATH for Qt Libraries
 # This must be done before the `yuzu` target is created
 if (YUZU_USE_BUNDLED_QT AND LINUX)
@@ -37,6 +40,8 @@ add_executable(yuzu
     applets/qt_web_browser_scripts.h
     bootmanager.cpp
     bootmanager.h
+    duskbloods_server.cpp
+    duskbloods_server.h
     configuration/configuration_shared.cpp
     configuration/configuration_shared.h
     configuration/configure.ui
